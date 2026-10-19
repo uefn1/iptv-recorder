@@ -1,7 +1,7 @@
-name: Auto 2h20m Record
+name: Auto 5:00-7:20 JST delay-safe
 on:
   schedule:
-    - cron: '0 20 * * *' # 明日からは毎日JST 5:00に自動
+    - cron: '45 19 * * *' # JST 4:45起動 = 5:00の15分前、遅延しても5:00に間に合う
   workflow_dispatch:
 
 jobs:
@@ -9,22 +9,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 250
     steps:
-      - name: JST 5:00まで待ってから2時間20分録画
+      - name: 4:45まで待機してから2時間35分録画
         run: |
           sudo apt-get update -qq && sudo apt-get install -y ffmpeg jq -qq
-          
-          # 今が4:07なら5:00まで53分待機、5:00過ぎならすぐ開始
+
+          # 手動で今(4:07)押した場合は4:45まで待機
           NOW=$(TZ=Asia/Tokyo date +%s)
-          TARGET=$(TZ=Asia/Tokyo date -d "05:00 today" +%s)
+          TARGET=$(TZ=Asia/Tokyo date -d "04:45 today" +%s)
           if [ $NOW -lt $TARGET ]; then
             SLEEP=$((TARGET - NOW))
-            echo "あと $SLEEP 秒待ってJST 5:00に開始します"
+            echo "遅延対策で $SLEEP 秒待って4:45に開始します"
             sleep $SLEEP
           fi
-          
+
+          # 4:45から7:20まで = 2時間35分 = 9300秒
+          # 遅れて5:00に始まっても7:35まで録るので5:00-7:20は確実にカバー
           ffmpeg -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 30 \
-            -i "${{ secrets.IPTV_URL }}" -t 8400 \
-            -c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 96k -y rec.mp4
+            -i "${{ secrets.IPTV_URL }}" -t 9300 \
+            -c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 96k -y rec_full.mp4
+
+          # 5:00-7:20だけを切り出し(最初の15分をカット)
+          ffmpeg -ss 900 -i rec_full.mp4 -t 8400 -c copy rec.mp4
 
       - name: R2へアップロード
         env:
