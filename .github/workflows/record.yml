@@ -1,0 +1,44 @@
+name: Auto 2h20m Record
+on:
+  schedule:
+    - cron: '0 20 * * *' # 明日からは毎日JST 5:00に自動
+  workflow_dispatch:
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 250
+    steps:
+      - name: JST 5:00まで待ってから2時間20分録画
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y ffmpeg jq -qq
+          
+          # 今が4:07なら5:00まで53分待機、5:00過ぎならすぐ開始
+          NOW=$(TZ=Asia/Tokyo date +%s)
+          TARGET=$(TZ=Asia/Tokyo date -d "05:00 today" +%s)
+          if [ $NOW -lt $TARGET ]; then
+            SLEEP=$((TARGET - NOW))
+            echo "あと $SLEEP 秒待ってJST 5:00に開始します"
+            sleep $SLEEP
+          fi
+          
+          ffmpeg -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 30 \
+            -i "${{ secrets.IPTV_URL }}" -t 8400 \
+            -c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 96k -y rec.mp4
+
+      - name: R2へアップロード
+        env:
+          R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
+          R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+          rclone config create r2 s3 provider Cloudflare access_key_id $R2_ACCESS_KEY secret_access_key $R2_SECRET_KEY endpoint https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com
+          DATE=$(date +"%Y%m%d_%H%M")
+          FILE="rec_${DATE}.mp4"
+          rclone copy rec.mp4 r2:iptv-archive/videos/$FILE --progress
+          rclone copy r2:iptv-archive/manifest.json ./ 2>/dev/null || echo '{"videos":[]}' > manifest.json
+          URL="${{ secrets.R2_PUBLIC_URL }}/videos/$FILE"
+          jq --arg t "録画 $DATE 5:00-7:20" --arg f "$FILE" --arg u "$URL" --arg d "$(date -Iseconds)" '.videos |= [{title:$t, filename:$f, url:$u, recorded_at:$d}] + .' manifest.json > new.json
+          mv new.json manifest.json
+          rclone copy manifest.json r2:iptv-archive/
