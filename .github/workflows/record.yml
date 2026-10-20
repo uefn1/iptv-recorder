@@ -1,35 +1,49 @@
-name: Auto 5:00-7:20 JST delay-safe
+# .github/workflows/record.yml
+name: Manual Record JST
 on:
-  schedule:
-    - cron: '45 19 * * *' # JST 4:45起動 = 5:00の15分前、遅延しても5:00に間に合う
   workflow_dispatch:
+    inputs:
+      jst_datetime:
+        description: '録画開始日時 JST (例: 2026-10-21 05:00)'
+        required: true
+        default: '2026-10-21 05:00'
+      duration_minutes:
+        description: '録画分数 (例: 140 = 2時間20分)'
+        required: true
+        default: '140'
 
 jobs:
   record:
-    runs-on: ubuntu-latest
-    timeout-minutes: 250
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
     steps:
-      - name: 4:45まで待機してから2時間35分録画
+      - name: 指定JSTまで待機して録画
         run: |
+          set -x
           sudo apt-get update -qq && sudo apt-get install -y ffmpeg jq -qq
 
-          # 手動で今(4:07)押した場合は4:45まで待機
-          NOW=$(TZ=Asia/Tokyo date +%s)
-          TARGET=$(TZ=Asia/Tokyo date -d "04:45 today" +%s)
-          if [ $NOW -lt $TARGET ]; then
-            SLEEP=$((TARGET - NOW))
-            echo "遅延対策で $SLEEP 秒待って4:45に開始します"
+          echo "指定: ${{ inputs.jst_datetime }} JST, ${{ inputs.duration_minutes }}分"
+
+          # JSTで解釈してUnix時間に変換
+          TARGET=$(TZ=Asia/Tokyo date -d "${{ inputs.jst_datetime }}" +%s)
+          NOW=$(date +%s)
+          SLEEP=$((TARGET - NOW))
+          
+          if [ $SLEEP -gt 0 ]; then
+            echo "JST ${{ inputs.jst_datetime }} まで ${SLEEP}秒 (${{ inputs.duration_minutes }}分後に終了予定) 待機します"
             sleep $SLEEP
+          else
+            echo "指定時刻は過去なので今すぐ開始します"
           fi
 
-          # 4:45から7:20まで = 2時間35分 = 9300秒
-          # 遅れて5:00に始まっても7:35まで録るので5:00-7:20は確実にカバー
-          ffmpeg -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 30 \
-            -i "${{ secrets.IPTV_URL }}" -t 9300 \
-            -c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 96k -y rec_full.mp4
+          SECS=$((${{ inputs.duration_minutes }} * 60))
+          echo "録画開始: ${SECS}秒"
+          
+          ffmpeg -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 30 -user_agent "VLC/3.0.20 LibVLC/3.0.20" \
+            -i "${{ secrets.IPTV_URL }}" -t $SECS \
+            -c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 96k -y rec.mp4
 
-          # 5:00-7:20だけを切り出し(最初の15分をカット)
-          ffmpeg -ss 900 -i rec_full.mp4 -t 8400 -c copy rec.mp4
+          ls -lh rec.mp4
 
       - name: R2へアップロード
         env:
@@ -37,13 +51,16 @@ jobs:
           R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
         run: |
+          set -x
           curl https://rclone.org/install.sh | sudo bash
           rclone config create r2 s3 provider Cloudflare access_key_id $R2_ACCESS_KEY secret_access_key $R2_SECRET_KEY endpoint https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com
-          DATE=$(date +"%Y%m%d_%H%M")
-          FILE="rec_${DATE}.mp4"
+
+          SAFE_DATE=$(echo "${{ inputs.jst_datetime }}" | sed 's/[^0-9]/_/g')
+          FILE="rec_${SAFE_DATE}_${{ inputs.duration_minutes }}m.mp4"
+
           rclone copy rec.mp4 r2:iptv-archive/videos/$FILE --progress
           rclone copy r2:iptv-archive/manifest.json ./ 2>/dev/null || echo '{"videos":[]}' > manifest.json
           URL="${{ secrets.R2_PUBLIC_URL }}/videos/$FILE"
-          jq --arg t "録画 $DATE 5:00-7:20" --arg f "$FILE" --arg u "$URL" --arg d "$(date -Iseconds)" '.videos |= [{title:$t, filename:$f, url:$u, recorded_at:$d}] + .' manifest.json > new.json
+          jq --arg t "録画 ${{ inputs.jst_datetime }} ${{ inputs.duration_minutes }}分" --arg f "$FILE" --arg u "$URL" --arg d "$(date -Iseconds)" '.videos |= [{title:$t, filename:$f, url:$u, recorded_at:$d}] + .' manifest.json > new.json
           mv new.json manifest.json
           rclone copy manifest.json r2:iptv-archive/
