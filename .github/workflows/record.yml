@@ -1,64 +1,70 @@
-# .github/workflows/record.yml
-name: Manual Record JST
+name: Record
 on:
   workflow_dispatch:
     inputs:
       jst_datetime:
-        description: '録画開始日時 JST (例: 2026-10-21 05:00)'
-        required: true
-        default: '2026-10-21 05:00'
+        description: 'JST 空なら今すぐ (例: 2026-10-21 05:00)'
+        required: false
+        default: ''
       duration_minutes:
-        description: '録画分数 (例: 140 = 2時間20分)'
+        description: '分数'
         required: true
         default: '140'
-
 jobs:
-  record:
+  job:
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     steps:
-      - name: 指定JSTまで待機して録画
-        run: |
-          set -x
-          sudo apt-get update -qq && sudo apt-get install -y ffmpeg jq -qq
-          TARGET=$(TZ=Asia/Tokyo date -d "${{ inputs.jst_datetime }}" +%s)
-          NOW=$(date +%s)
-          SLEEP=$((TARGET - NOW))
-          if [ $SLEEP -gt 0 ]; then sleep $SLEEP; fi
-          SECS=$((${{ inputs.duration_minutes }} * 60))
-          ffmpeg -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 30 -user_agent "VLC/3.0.20 LibVLC/3.0.20" \
-            -i "${{ secrets.IPTV_URL }}" -t $SECS \
-            -c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 96k -y rec.mp4
-          ls -lh rec.mp4
-
-      - name: R2へアップロード
+      - uses: actions/checkout@v4
+      - name: Record or Queue
         env:
+          IPTV_URL: ${{ secrets.IPTV_URL }}
           R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
           R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
         run: |
-          set -x
-          R2_ACCESS_KEY=$(echo "$R2_ACCESS_KEY" | tr -d '[:space:]')
-          R2_SECRET_KEY=$(echo "$R2_SECRET_KEY" | tr -d '[:space:]')
-          R2_ACCOUNT_ID=$(echo "$R2_ACCOUNT_ID" | tr -d '[:space:]')
+          set -e
+          sudo apt-get update -qq && sudo apt-get install -y ffmpeg jq -qq
 
-          curl https://rclone.org/install.sh | sudo bash
-          rclone config create r2 s3 provider Cloudflare access_key_id $R2_ACCESS_KEY secret_access_key $R2_SECRET_KEY endpoint https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com region auto
+          JST_INPUT="${{ inputs.jst_datetime }}"
+          DUR="${{ inputs.duration_minutes }}"
 
-          SAFE_DATE=$(echo "${{ inputs.jst_datetime }}" | sed 's/[^0-9]/_/g')
-          FILE="rec_${SAFE_DATE}_${{ inputs.duration_minutes }}m.mp4"
-
-          rclone copyto rec.mp4 r2:iptv-archive/videos/$FILE --progress --log-level INFO
-
-          # manifestが無ければ作る - 修正点ここ
-          rclone copyto r2:iptv-archive/manifest.json ./manifest.json 2>/dev/null || true
-          if [ ! -f manifest.json ]; then
-            echo '{"videos":[]}' > manifest.json
+          if [ -z "$JST_INPUT" ]; then
+            MODE="now"
+          else
+            TARGET=$(TZ=Asia/Tokyo date -d "$JST_INPUT" +%s)
+            NOW=$(date +%s)
+            if [ $((TARGET - NOW)) -le 60 ]; then MODE="now"; else MODE="queue"; fi
           fi
-          cat manifest.json
 
-          URL="${{ secrets.R2_PUBLIC_URL }}/videos/$FILE"
-          jq --arg t "録画 ${{ inputs.jst_datetime }} ${{ inputs.duration_minutes }}分" --arg f "$FILE" --arg u "$URL" --arg d "$(date -Iseconds)" '.videos |= [{title:$t, filename:$f, url:$u, recorded_at:$d}] + .' manifest.json > new.json
+          if [ "$MODE" = "queue" ]; then
+            [ -f queue.json ] || echo '[]' > queue.json
+            jq --arg d "$JST_INPUT" --arg m "$DUR" '. += [{jst_datetime:$d, duration_minutes:($m|tonumber)}]' queue.json > new.json
+            mv new.json queue.json
+            git config user.name "bot"
+            git config user.email "bot@bot.com"
+            git add queue.json
+            git commit -m "queue $JST_INPUT" || true
+            git push
+            exit 0
+          fi
+
+          # ここから録画 - シークレットは環境変数経由なのでログに出ない
+          curl -s https://rclone.org/install.sh | sudo bash
+          R2_AK=$(echo "$R2_ACCESS_KEY" | tr -d '[:space:]')
+          R2_SK=$(echo "$R2_SECRET_KEY" | tr -d '[:space:]')
+          R2_ID=$(echo "$R2_ACCOUNT_ID" | tr -d '[:space:]')
+          rclone config create r2 s3 provider Cloudflare access_key_id "$R2_AK" secret_access_key "$R2_SK" endpoint "https://$R2_ID.r2.cloudflarestorage.com" region auto --quiet
+
+          SECS=$((DUR * 60))
+          ffmpeg -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 30 -user_agent "VLC/3.0.20 LibVLC/3.0.20" -i "$IPTV_URL" -t $SECS -c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 96k -y rec.mp4
+
+          FILE="rec_$(TZ=Asia/Tokyo date '+%Y_%m_%d_%H_%M')_${DUR}m.mp4"
+          rclone copyto rec.mp4 r2:iptv-archive/videos/"$FILE" --quiet
+          rclone copyto r2:iptv-archive/manifest.json ./manifest.json 2>/dev/null || true
+          [ -f manifest.json ] || echo '{"videos":[]}' > manifest.json
+          URL="$R2_PUBLIC_URL/videos/$FILE"
+          jq --arg t "録画 $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M') ${DUR}分" --arg f "$FILE" --arg u "$URL" --arg d "$(date -Iseconds)" '.videos |= [{title:$t, filename:$f, url:$u, recorded_at:$d}] + .' manifest.json > new.json
           mv new.json manifest.json
-          rclone copyto ./manifest.json r2:iptv-archive/manifest.json
-          echo "完了: $URL"
+          rclone copyto ./manifest.json r2:iptv-archive/manifest.json --quiet
