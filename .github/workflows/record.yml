@@ -21,32 +21,15 @@ jobs:
         run: |
           set -x
           sudo apt-get update -qq && sudo apt-get install -y ffmpeg jq -qq
-
-          echo "指定: ${{ inputs.jst_datetime }} JST, ${{ inputs.duration_minutes }}分"
-
           TARGET=$(TZ=Asia/Tokyo date -d "${{ inputs.jst_datetime }}" +%s)
           NOW=$(date +%s)
           SLEEP=$((TARGET - NOW))
-          
-          if [ $SLEEP -gt 0 ]; then
-            echo "JST ${{ inputs.jst_datetime }} まで ${SLEEP}秒待機します"
-            sleep $SLEEP
-          else
-            echo "指定時刻は過去なので今すぐ開始します"
-          fi
-
+          if [ $SLEEP -gt 0 ]; then sleep $SLEEP; fi
           SECS=$((${{ inputs.duration_minutes }} * 60))
-          echo "録画開始: ${SECS}秒"
-
           ffmpeg -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 30 -user_agent "VLC/3.0.20 LibVLC/3.0.20" \
             -i "${{ secrets.IPTV_URL }}" -t $SECS \
             -c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 96k -y rec.mp4
-
           ls -lh rec.mp4
-          if [ ! -f rec.mp4 ]; then
-            echo "rec.mp4がありません。IPTV_URLを確認してください"
-            exit 1
-          fi
 
       - name: R2へアップロード
         env:
@@ -55,18 +38,27 @@ jobs:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
         run: |
           set -x
+          R2_ACCESS_KEY=$(echo "$R2_ACCESS_KEY" | tr -d '[:space:]')
+          R2_SECRET_KEY=$(echo "$R2_SECRET_KEY" | tr -d '[:space:]')
+          R2_ACCOUNT_ID=$(echo "$R2_ACCOUNT_ID" | tr -d '[:space:]')
+
           curl https://rclone.org/install.sh | sudo bash
           rclone config create r2 s3 provider Cloudflare access_key_id $R2_ACCESS_KEY secret_access_key $R2_SECRET_KEY endpoint https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com region auto
-
-          rclone lsd r2: --log-level INFO
 
           SAFE_DATE=$(echo "${{ inputs.jst_datetime }}" | sed 's/[^0-9]/_/g')
           FILE="rec_${SAFE_DATE}_${{ inputs.duration_minutes }}m.mp4"
 
           rclone copyto rec.mp4 r2:iptv-archive/videos/$FILE --progress --log-level INFO
 
-          rclone copyto r2:iptv-archive/manifest.json ./manifest.json 2>/dev/null || echo '{"videos":[]}' > manifest.json
+          # manifestが無ければ作る - 修正点ここ
+          rclone copyto r2:iptv-archive/manifest.json ./manifest.json 2>/dev/null || true
+          if [ ! -f manifest.json ]; then
+            echo '{"videos":[]}' > manifest.json
+          fi
+          cat manifest.json
+
           URL="${{ secrets.R2_PUBLIC_URL }}/videos/$FILE"
           jq --arg t "録画 ${{ inputs.jst_datetime }} ${{ inputs.duration_minutes }}分" --arg f "$FILE" --arg u "$URL" --arg d "$(date -Iseconds)" '.videos |= [{title:$t, filename:$f, url:$u, recorded_at:$d}] + .' manifest.json > new.json
           mv new.json manifest.json
           rclone copyto ./manifest.json r2:iptv-archive/manifest.json
+          echo "完了: $URL"
