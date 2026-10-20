@@ -2,14 +2,31 @@ name: Record
 on:
   workflow_dispatch:
     inputs:
-      jst_datetime:
-        description: 'JST 空なら今すぐ (例: 2026-10-21 05:00)'
+      year:
+        description: '年 (例: 2026) 空なら今年 / 今すぐなら全部空'
+        required: false
+        default: ''
+      month:
+        description: '月 1-12'
+        required: false
+        default: ''
+      day:
+        description: '日 1-31'
+        required: false
+        default: ''
+      hour:
+        description: '時 0-23 JST'
+        required: false
+        default: ''
+      minute:
+        description: '分 0-59 JST'
         required: false
         default: ''
       duration_minutes:
-        description: '分数'
+        description: '録画分数'
         required: true
         default: '140'
+
 jobs:
   job:
     runs-on: ubuntu-24.04
@@ -27,30 +44,57 @@ jobs:
           set -e
           sudo apt-get update -qq && sudo apt-get install -y ffmpeg jq -qq
 
-          JST_INPUT="${{ inputs.jst_datetime }}"
+          # 現在JST
+          CY=$(TZ=Asia/Tokyo date +%Y)
+          CM=$(TZ=Asia/Tokyo date +%m)
+          CD=$(TZ=Asia/Tokyo date +%d)
+          CH=$(TZ=Asia/Tokyo date +%H)
+          CMI=$(TZ=Asia/Tokyo date +%M)
+
+          Y="${{ inputs.year }}"
+          MO="${{ inputs.month }}"
+          D="${{ inputs.day }}"
+          H="${{ inputs.hour }}"
+          MI="${{ inputs.minute }}"
           DUR="${{ inputs.duration_minutes }}"
 
-          if [ -z "$JST_INPUT" ]; then
+          # 全部空なら今すぐ
+          if [ -z "$Y" ] && [ -z "$MO" ] && [ -z "$D" ] && [ -z "$H" ] && [ -z "$MI" ]; then
             MODE="now"
+            JST_LABEL="$(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M')"
           else
+            [ -z "$Y" ] && Y=$CY
+            [ -z "$MO" ] && MO=$CM
+            [ -z "$D" ] && D=$CD
+            [ -z "$H" ] && H=$CH
+            [ -z "$MI" ] && MI=$CMI
+            # 0埋め
+            MO=$(printf "%02d" "$MO")
+            D=$(printf "%02d" "$D")
+            H=$(printf "%02d" "$H")
+            MI=$(printf "%02d" "$MI")
+            JST_INPUT="$Y-$MO-$D $H:$MI"
+            
             TARGET=$(TZ=Asia/Tokyo date -d "$JST_INPUT" +%s)
             NOW=$(date +%s)
             if [ $((TARGET - NOW)) -le 60 ]; then MODE="now"; else MODE="queue"; fi
+            JST_LABEL="$JST_INPUT"
           fi
+
+          echo "Mode: $MODE Target: $JST_LABEL"
 
           if [ "$MODE" = "queue" ]; then
             [ -f queue.json ] || echo '[]' > queue.json
-            jq --arg d "$JST_INPUT" --arg m "$DUR" '. += [{jst_datetime:$d, duration_minutes:($m|tonumber)}]' queue.json > new.json
+            jq --arg d "$JST_LABEL" --arg m "$DUR" '. += [{jst_datetime:$d, duration_minutes:($m|tonumber)}]' queue.json > new.json
             mv new.json queue.json
             git config user.name "bot"
             git config user.email "bot@bot.com"
             git add queue.json
-            git commit -m "queue $JST_INPUT" || true
+            git commit -m "queue $JST_LABEL" || true
             git push
             exit 0
           fi
 
-          # ここから録画 - シークレットは環境変数経由なのでログに出ない
           curl -s https://rclone.org/install.sh | sudo bash
           R2_AK=$(echo "$R2_ACCESS_KEY" | tr -d '[:space:]')
           R2_SK=$(echo "$R2_SECRET_KEY" | tr -d '[:space:]')
@@ -61,10 +105,11 @@ jobs:
           ffmpeg -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 30 -user_agent "VLC/3.0.20 LibVLC/3.0.20" -i "$IPTV_URL" -t $SECS -c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 96k -y rec.mp4
 
           FILE="rec_$(TZ=Asia/Tokyo date '+%Y_%m_%d_%H_%M')_${DUR}m.mp4"
+          [ "$MODE" != "now" ] && FILE="rec_${JST_LABEL//[^0-9]/_}_${DUR}m.mp4"
           rclone copyto rec.mp4 r2:iptv-archive/videos/"$FILE" --quiet
           rclone copyto r2:iptv-archive/manifest.json ./manifest.json 2>/dev/null || true
           [ -f manifest.json ] || echo '{"videos":[]}' > manifest.json
           URL="$R2_PUBLIC_URL/videos/$FILE"
-          jq --arg t "録画 $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M') ${DUR}分" --arg f "$FILE" --arg u "$URL" --arg d "$(date -Iseconds)" '.videos |= [{title:$t, filename:$f, url:$u, recorded_at:$d}] + .' manifest.json > new.json
+          jq --arg t "録画 $JST_LABEL ${DUR}分" --arg f "$FILE" --arg u "$URL" --arg d "$(date -Iseconds)" '.videos |= [{title:$t, filename:$f, url:$u, recorded_at:$d}] + .' manifest.json > new.json
           mv new.json manifest.json
           rclone copyto ./manifest.json r2:iptv-archive/manifest.json --quiet
