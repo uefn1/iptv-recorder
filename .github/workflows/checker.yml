@@ -10,9 +10,9 @@ permissions:
 jobs:
   watch:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15 # 10分監視 + 余裕
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -27,45 +27,54 @@ jobs:
           set -e
           sudo apt-get install -y ffmpeg jq -qq
           curl -s https://rclone.org/install.sh | sudo bash
-
           R2_AK=$(echo "$R2_ACCESS_KEY" | tr -d '[:space:]')
           R2_SK=$(echo "$R2_SECRET_KEY" | tr -d '[:space:]')
           R2_ID=$(echo "$R2_ACCOUNT_ID" | tr -d '[:space:]')
           rclone config create r2 s3 provider Cloudflare access_key_id "$R2_AK" secret_access_key "$R2_SK" endpoint "https://$R2_ID.r2.cloudflarestorage.com" region auto --quiet
 
           START=$(date +%s)
-          END=$((START + 600)) # 10分間
-          echo "Watcher start $(TZ=Asia/Tokyo date) -> end in 10min"
+          END=$((START + 600))
+          echo "Watcher start $(TZ=Asia/Tokyo date) -> 10min"
 
           while [ $(date +%s) -lt $END ]; do
-            git pull --rebase --quiet || true
+            # 競合を防ぐ: 常にリモートを基準にリセット
+            git fetch origin main --quiet
+            git reset --hard origin/main --quiet
             [ -f queue.json ] || echo '[]' > queue.json
 
             NOW=$(date +%s)
-            # 期限切れ削除
             TMP_Q="[]"
+            CLEANED=false
+
             jq -c '.[]' queue.json > /tmp/rows.txt || true
             while IFS= read -r row; do
               [ -z "$row" ] && continue
               JST=$(echo "$row" | jq -r .jst_datetime)
               TARGET=$(TZ=Asia/Tokyo date -d "$JST" +%s)
-              DIFF=$((NOW - TARGET))
-              if [ $DIFF -ge 300 ]; then
+              if [ $((NOW - TARGET)) -ge 300 ]; then
                 echo "[CLEAN] expired $JST"
+                CLEANED=true
               else
                 TMP_Q=$(echo "$TMP_Q" | jq --argjson r "$row" '. += [$r]')
               fi
             done < /tmp/rows.txt
-            echo "$TMP_Q" > queue.json
 
-            # 次の録画を探す - 5分前から対象
+            if [ "$CLEANED" = true ]; then
+              echo "$TMP_Q" > queue.json
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git add queue.json
+              git commit -m "clean expired" || true
+              git push --quiet || true
+              continue
+            fi
+
+            # 5分前〜60秒過ぎまでを検知
             FOUND=""
-            jq -c '.[]' queue.json > /tmp/rows.txt || true
             while IFS= read -r row; do
               JST=$(echo "$row" | jq -r .jst_datetime)
               TARGET=$(TZ=Asia/Tokyo date -d "$JST" +%s)
               REMAIN=$((TARGET - NOW))
-              # 5分前(300秒前)〜過ぎて60秒以内なら準備開始
               if [ $REMAIN -le 300 ] && [ $REMAIN -ge -60 ]; then
                 FOUND="$row"
                 break
@@ -73,7 +82,7 @@ jobs:
             done < /tmp/rows.txt
 
             if [ -z "$FOUND" ]; then
-              echo "[$(TZ=Asia/Tokyo date '+%H:%M:%S')] 待機中... queue: $(jq length queue.json)件"
+              echo "[$(TZ=Asia/Tokyo date '+%H:%M:%S')] 待機 queue:$(jq length queue.json)"
               sleep 30
               continue
             fi
@@ -81,41 +90,45 @@ jobs:
             JST=$(echo "$FOUND" | jq -r .jst_datetime)
             DUR=$(echo "$FOUND" | jq -r .duration_minutes)
             TARGET=$(TZ=Asia/Tokyo date -d "$JST" +%s)
-            echo ">>> 5分前検知: $JST ${DUR}分 録画準備"
+            echo ">>> 5分前検知 $JST ${DUR}分 HLS .ts先行取得開始"
 
-            # HLS事前解析 - ストリームが生きてるかffprobeで確認し続ける
-            echo "HLS解析開始 $IPTV_URL"
-            for i in {1..60}; do
-              if ffprobe -v error -analyzeduration 1M -probesize 1M -i "$IPTV_URL" -t 1 -f null - 2>&1 | head -n 5; then
-                echo "HLS OK"
-                break
+            # === HLS .ts 事前取得 ===
+            mkdir -p /tmp/hls_pre
+            for i in $(seq 1 30); do
+              NOW2=$(date +%s)
+              REMAIN2=$((TARGET - NOW2))
+              if [ $REMAIN2 -le 3 ]; then break; fi
+              echo "[pre-fetch $i] .ts取得試行..."
+              # 2秒だけ本番と同じ条件で.tsを取得
+              if timeout 15 ffmpeg -reconnect 1 -reconnect_at_eof 1 -reconnect_delay_max 10 -user_agent "VLC/3.0.20" -i "$IPTV_URL" -t 2 -c copy -f mpegts /tmp/hls_pre/pre_${i}.ts -y -loglevel error; then
+                ls -lh /tmp/hls_pre/pre_${i}.ts
+                echo ".ts取得OK - HLSは生きてる"
+                rm -f /tmp/hls_pre/*.ts
+              else
+                echo ".ts取得失敗、リトライ"
               fi
-              echo "HLS not ready, retry $i"
-              sleep 5
+              sleep 10
+              # 録画時間直前までループ
+              if [ $(date +%s) -ge $((TARGET - 3)) ]; then break; fi
             done
 
-            # 録画時間ジャストまで待機
+            # ジャストまで待機
             NOW=$(date +%s)
-            SLEEP_SEC=$((TARGET - NOW - 2)) # 2秒早めに開始して完璧に合わせる
-            if [ $SLEEP_SEC -gt 0 ]; then
-              echo "録画時間まで ${SLEEP_SEC}秒 待機..."
-              sleep $SLEEP_SEC
-            fi
+            SLEEP_SEC=$((TARGET - NOW - 1))
+            [ $SLEEP_SEC -gt 0 ] && echo "${SLEEP_SEC}秒待機してジャスト開始" && sleep $SLEEP_SEC
 
-            # キューから原子的に削除 - 他のCheckerと被ったら失敗する
-            git pull --rebase
+            # キューから削除を確定
+            git fetch origin main --quiet
+            git reset --hard origin/main --quiet
             jq --arg d "$JST" 'map(select(.jst_datetime != $d))' queue.json > new.json
             mv new.json queue.json
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add queue.json
             git commit -m "dequeue $JST" || true
-            if ! git push; then
-              echo "他Checkerが先に取得済み、スキップ"
-              continue
-            fi
+            git push --quiet || { echo "他Checkerが取得済み"; continue; }
 
-            echo "=== 録画開始 ジャスト $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M:%S') ==="
+            echo "=== 録画開始 ジャスト $(TZ=Asia/Tokyo date '+%H:%M:%S') ==="
             SECS=$((DUR * 60))
             ffmpeg -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 30 -user_agent "VLC/3.0.20 LibVLC/3.0.20" -i "$IPTV_URL" -t $SECS -c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 96k -y rec.mp4
 
@@ -127,13 +140,7 @@ jobs:
             jq --arg t "録画 $JST ${DUR}分" --arg f "$FILE" --arg u "$URL" --arg d "$(date -Iseconds)" '.videos |= [{title:$t, filename:$f, url:$u, recorded_at:$d}] + .' manifest.json > new.json
             mv new.json manifest.json
             rclone copyto ./manifest.json r2:iptv-archive/manifest.json --quiet
-            echo "=== 録画完了 ==="
-
-            # 録画が長くて10分枠を超えたらこのWatcherはここで終了、次の10分Checkerに引き継ぎ
-            if [ $(date +%s) -ge $END ]; then
-              echo "10分枠終了、次Checkerに引き継ぎ"
-              exit 0
-            fi
+            echo "=== 完了 ==="
+            if [ $(date +%s) -ge $END ]; then exit 0; fi
           done
-
-          echo "10分監視終了 - 次のCheckerが自動起動します"
+          echo "10分監視終了"
