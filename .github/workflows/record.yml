@@ -56,7 +56,9 @@ jobs:
         run: |
           set -x
           curl https://rclone.org/install.sh | sudo bash
-          rclone config create r2 s3 provider Cloudflare access_key_id $R2_ACCESS_KEY secret_access_key $R2_SECRET_KEY endpoint https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com
+          rclone config create r2 s3 provider Cloudflare access_key_id $R2_ACCESS_KEY secret_access_key $R2_SECRET_KEY endpoint https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com region auto
+
+          rclone lsd r2: --log-level INFO
 
           SAFE_DATE=$(echo "${{ inputs.jst_datetime }}" | sed 's/[^0-9]/_/g')
           FILE="rec_${SAFE_DATE}_${{ inputs.duration_minutes }}m.mp4"
