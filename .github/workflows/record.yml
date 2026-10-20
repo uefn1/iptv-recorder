@@ -24,13 +24,12 @@ jobs:
 
           echo "指定: ${{ inputs.jst_datetime }} JST, ${{ inputs.duration_minutes }}分"
 
-          # JSTで解釈してUnix時間に変換
           TARGET=$(TZ=Asia/Tokyo date -d "${{ inputs.jst_datetime }}" +%s)
           NOW=$(date +%s)
           SLEEP=$((TARGET - NOW))
           
           if [ $SLEEP -gt 0 ]; then
-            echo "JST ${{ inputs.jst_datetime }} まで ${SLEEP}秒 (${{ inputs.duration_minutes }}分後に終了予定) 待機します"
+            echo "JST ${{ inputs.jst_datetime }} まで ${SLEEP}秒待機します"
             sleep $SLEEP
           else
             echo "指定時刻は過去なので今すぐ開始します"
@@ -38,12 +37,16 @@ jobs:
 
           SECS=$((${{ inputs.duration_minutes }} * 60))
           echo "録画開始: ${SECS}秒"
-          
+
           ffmpeg -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 30 -user_agent "VLC/3.0.20 LibVLC/3.0.20" \
             -i "${{ secrets.IPTV_URL }}" -t $SECS \
             -c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 96k -y rec.mp4
 
           ls -lh rec.mp4
+          if [ ! -f rec.mp4 ]; then
+            echo "rec.mp4がありません。IPTV_URLを確認してください"
+            exit 1
+          fi
 
       - name: R2へアップロード
         env:
@@ -58,9 +61,10 @@ jobs:
           SAFE_DATE=$(echo "${{ inputs.jst_datetime }}" | sed 's/[^0-9]/_/g')
           FILE="rec_${SAFE_DATE}_${{ inputs.duration_minutes }}m.mp4"
 
-          rclone copy rec.mp4 r2:iptv-archive/videos/$FILE --progress
-          rclone copy r2:iptv-archive/manifest.json ./ 2>/dev/null || echo '{"videos":[]}' > manifest.json
+          rclone copyto rec.mp4 r2:iptv-archive/videos/$FILE --progress --log-level INFO
+
+          rclone copyto r2:iptv-archive/manifest.json ./manifest.json 2>/dev/null || echo '{"videos":[]}' > manifest.json
           URL="${{ secrets.R2_PUBLIC_URL }}/videos/$FILE"
           jq --arg t "録画 ${{ inputs.jst_datetime }} ${{ inputs.duration_minutes }}分" --arg f "$FILE" --arg u "$URL" --arg d "$(date -Iseconds)" '.videos |= [{title:$t, filename:$f, url:$u, recorded_at:$d}] + .' manifest.json > new.json
           mv new.json manifest.json
-          rclone copy manifest.json r2:iptv-archive/
+          rclone copyto ./manifest.json r2:iptv-archive/manifest.json
