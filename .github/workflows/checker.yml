@@ -3,15 +3,21 @@ on:
   schedule:
     - cron: '*/5 * * * *'
   workflow_dispatch:
+
+permissions:
+  contents: write
+
 concurrency:
   group: iptv-record
   cancel-in-progress: false
+
 jobs:
   run:
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
+
       - name: Check and Record
         env:
           IPTV_URL: ${{ secrets.IPTV_URL }}
@@ -22,28 +28,58 @@ jobs:
         run: |
           set -e
           sudo apt-get install -y ffmpeg jq -qq
-          [ -f queue.json ] || exit 0
-          NOW=$(TZ=Asia/Tokyo date +%s)
-          JOB=$(jq --argjson now "$NOW" -r 'map(select(($now - (.jst_datetime | strptime("%Y-%m-%d %H:%M") | mktime)) >= -250 and ($now - (.jst_datetime | strptime("%Y-%m-%d %H:%M") | mktime)) < 350)) | .[0] | @base64' queue.json)
-          [ "$JOB" = "null" ] && exit 0
-          echo "$JOB" | base64 -d > /tmp/job.json
-          JST=$(jq -r .jst_datetime /tmp/job.json)
-          DUR=$(jq -r .duration_minutes /tmp/job.json)
+
+          echo "=== queue.json ==="
+          cat queue.json 2>&1 || echo "[]"
+          [ -f queue.json ] || echo '[]' > queue.json
+
+          NOW=$(date +%s)
+          NOW_JST=$(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M:%S JST')
+          echo "NOW epoch=$NOW ($NOW_JST)"
+
+          # 予約を1件ずつチェック - JSTを正しくepochに変換
+          FOUND=""
+          for row in $(jq -c '.[]' queue.json); do
+            JST=$(echo "$row" | jq -r .jst_datetime)
+            DUR=$(echo "$row" | jq -r .duration_minutes)
+            TARGET=$(TZ=Asia/Tokyo date -d "$JST" +%s)
+            DIFF=$((NOW - TARGET))
+            echo "check $JST -> target=$TARGET diff=${DIFF}s dur=${DUR}m"
+            # -5分〜+5分の間なら実行
+            if [ $DIFF -ge -300 ] && [ $DIFF -lt 300 ]; then
+              FOUND="$row"
+              break
+            fi
+          done
+
+          if [ -z "$FOUND" ]; then
+            echo "実行対象なし"
+            exit 0
+          fi
+
+          JST=$(echo "$FOUND" | jq -r .jst_datetime)
+          DUR=$(echo "$FOUND" | jq -r .duration_minutes)
+          echo ">>> 録画開始 $JST ${DUR}分"
+
+          # キューから削除してpush
           jq --arg d "$JST" 'map(select(.jst_datetime != $d))' queue.json > new.json
           mv new.json queue.json
-          git config user.name "bot"
-          git config user.email "bot@bot.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git add queue.json
           git commit -m "dequeue $JST" || true
           git push
 
+          # 録画
           curl -s https://rclone.org/install.sh | sudo bash
           R2_AK=$(echo "$R2_ACCESS_KEY" | tr -d '[:space:]')
           R2_SK=$(echo "$R2_SECRET_KEY" | tr -d '[:space:]')
           R2_ID=$(echo "$R2_ACCOUNT_ID" | tr -d '[:space:]')
           rclone config create r2 s3 provider Cloudflare access_key_id "$R2_AK" secret_access_key "$R2_SK" endpoint "https://$R2_ID.r2.cloudflarestorage.com" region auto --quiet
+
           SECS=$((DUR * 60))
           ffmpeg -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 30 -user_agent "VLC/3.0.20 LibVLC/3.0.20" -i "$IPTV_URL" -t $SECS -c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 96k -y rec.mp4
+          
           FILE="rec_$(echo $JST | sed 's/[^0-9]/_/g')_${DUR}m.mp4"
           rclone copyto rec.mp4 r2:iptv-archive/videos/"$FILE" --quiet
           rclone copyto r2:iptv-archive/manifest.json ./manifest.json 2>/dev/null || true
