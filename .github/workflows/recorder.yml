@@ -4,8 +4,10 @@ on:
     inputs:
       jst_datetime:
         required: true
+        type: string
       duration_minutes:
         required: true
+        type: string
 
 permissions:
   contents: write
@@ -20,7 +22,7 @@ jobs:
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v5
-      - name: Record
+      - name: Early Record + Cut
         env:
           IPTV_URL: ${{ secrets.IPTV_URL }}
           R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
@@ -31,26 +33,37 @@ jobs:
           DUR: ${{ inputs.duration_minutes }}
         run: |
           set -e
-          sudo apt-get install -y ffmpeg jq -qq
+          sudo apt-get install -y ffmpeg -qq
+          TARGET=$(TZ=Asia/Tokyo date -d "$JST" +%s)
+          NOW=$(date +%s)
+          EARLY=$((TARGET - NOW))
+          # 早くても300秒前から、遅くても60秒前からは確保
+          if [ $EARLY -gt 300 ]; then EARLY=300; fi
+          if [ $EARLY -lt 60 ]; then EARLY=60; fi
+          # 早めに開始した分を後でカット
+          echo "本来開始 $JST"
+          echo "早め開始 ${EARLY}秒前から録画"
+
+          TOTAL_SECS=$((DUR * 60 + EARLY + 10))
+          echo "合計録画 ${TOTAL_SECS}秒 (早め${EARLY}s + 本編${DUR}分 + 余裕10s)"
+
+          # 1. 早めから録画開始 - .ts先行取得兼ねてすぐ回す
+          ffmpeg -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 30 -rw_timeout 15000000 -user_agent "VLC/3.0.20" -i "$IPTV_URL" -t $TOTAL_SECS -c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 96k -y rec_raw.mp4
+
+          # 2. 本来の開始時間からカット
+          echo "=== カット: 先頭${EARLY}秒を削除して本来の開始時間からにする ==="
+          ffmpeg -ss $EARLY -i rec_raw.mp4 -c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 96k -y rec.mp4
+          rm rec_raw.mp4
+          ls -lh rec.mp4
+
           curl -s https://rclone.org/install.sh | sudo bash
           rclone config create r2 s3 provider Cloudflare access_key_id "$(echo "$R2_ACCESS_KEY" | tr -d '[:space:]')" secret_access_key "$(echo "$R2_SECRET_KEY" | tr -d '[:space:]')" endpoint "https://$(echo "$R2_ACCOUNT_ID" | tr -d '[:space:]').r2.cloudflarestorage.com" region auto --quiet
-
-          echo "=== 録画開始 $JST ${DUR}分 ==="
-          SECS=$((DUR * 60))
-          set +e
-          for i in 1 2 3 4 5; do
-            ffmpeg -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 30 -rw_timeout 15000000 -user_agent "VLC/3.0.20" -i "$IPTV_URL" -t $SECS -c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 96k -y rec.mp4
-            [ $? -eq 0 ] && break
-            echo "リトライ $i/5"
-            sleep 10
-          done
-          set -e
-          [ -f rec.mp4 ] || exit 1
 
           FILE="rec_$(echo $JST | sed 's/[^0-9]/_/g')_${DUR}m.mp4"
           rclone copyto rec.mp4 r2:iptv-archive/videos/"$FILE" --quiet
           rclone copyto r2:iptv-archive/manifest.json ./manifest.json 2>/dev/null || true
           [ -f manifest.json ] || echo '{"videos":[]}' > manifest.json
+          sudo apt-get install -y jq -qq
           URL="$R2_PUBLIC_URL/videos/$FILE"
           jq --arg t "録画 $JST ${DUR}分" --arg f "$FILE" --arg u "$URL" --arg d "$(date -Iseconds)" '.videos |= [{title:$t, filename:$f, url:$u, recorded_at:$d}] + .' manifest.json > new.json
           mv new.json manifest.json
