@@ -67,8 +67,9 @@ jobs:
             git commit -m "dequeue $JST -> recorder" || true
             git push --quiet || continue
 
-            echo "$GH_TOKEN" | gh auth login --with-token
+            # GH_TOKENがあればログイン不要、そのままghで起動
             gh workflow run recorder.yml --ref main --field jst_datetime="$JST" --field duration_minutes="$DUR"
+            echo "recorder起動完了"
           done
 
       - name: 次のChecker自動起動
@@ -76,5 +77,4 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "$GH_TOKEN" | gh auth login --with-token
           gh workflow run checker.yml --ref main || true
