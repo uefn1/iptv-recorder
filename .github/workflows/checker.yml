@@ -3,6 +3,9 @@ on:
   schedule:
     - cron: '*/10 * * * *'
   workflow_dispatch:
+  push:
+    paths:
+      - queue.json
 
 permissions:
   contents: write
@@ -17,26 +20,18 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: 10分間常時監視
+      - name: 10分監視 + recorder起動
         env:
           IPTV_URL: ${{ secrets.IPTV_URL }}
-          R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
-          R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
           sudo apt-get install -y ffmpeg jq curl -qq
-          curl -s https://rclone.org/install.sh | sudo bash
-          rclone config create r2 s3 provider Cloudflare access_key_id "$(echo "$R2_ACCESS_KEY" | tr -d '[:space:]')" secret_access_key "$(echo "$R2_SECRET_KEY" | tr -d '[:space:]')" endpoint "https://$(echo "$R2_ACCOUNT_ID" | tr -d '[:space:]').r2.cloudflarestorage.com" region auto --quiet
-
           START=$(date +%s)
           END=$((START + 600))
-          echo "Watcher start $(TZ=Asia/Tokyo date) 10min"
 
           is_online() {
             CODE=$(curl -L -s -o /dev/null -w "%{http_code}" -A "VLC/3.0.20" "$IPTV_URL" --max-time 10)
-            echo "HTTP $CODE"
             [ "$CODE" = "200" ]
           }
 
@@ -46,10 +41,10 @@ jobs:
             [ -f queue.json ] || echo '[]' > queue.json
             NOW=$(date +%s)
 
+            # 期限切れ削除
             TMP_Q="[]"
             jq -c '.[]' queue.json > /tmp/rows.txt || true
             while IFS= read -r row; do
-              [ -z "$row" ] && continue
               JST=$(echo "$row" | jq -r .jst_datetime)
               TARGET=$(TZ=Asia/Tokyo date -d "$JST" +%s 2>/dev/null || echo 0)
               if [ $((NOW - TARGET)) -ge 600 ]; then echo "expired $JST"; else TMP_Q=$(echo "$TMP_Q" | jq --argjson r "$row" '. += [$r]'); fi
@@ -64,17 +59,16 @@ jobs:
               if [ $REMAIN -le 300 ] && [ $REMAIN -ge -60 ]; then FOUND="$row"; break; fi
             done < /tmp/rows.txt
 
-            if [ -z "$FOUND" ]; then echo "[$(TZ=Asia/Tokyo date '+%H:%M:%S')] 待機"; sleep 30; continue; fi
+            if [ -z "$FOUND" ]; then sleep 30; continue; fi
 
             JST=$(echo "$FOUND" | jq -r .jst_datetime)
             DUR=$(echo "$FOUND" | jq -r .duration_minutes)
-            echo ">>> 5分前 $JST"
-
-            if ! is_online; then echo "!!! オフライン、次に委任"; sleep 60; continue; fi
+            echo ">>> 5分前検知 $JST ${DUR}分"
 
             # .ts先行取得
             set +e
-            timeout 20 ffmpeg -reconnect 1 -rw_timeout 10000000 -user_agent "VLC/3.0.20" -i "$IPTV_URL" -t 1 -c copy -f mpegts /tmp/pre.ts -y 2>&1 | tail -n 10
+            if ! is_online; then echo "オフライン"; sleep 60; continue; fi
+            timeout 20 ffmpeg -reconnect 1 -rw_timeout 10000000 -user_agent "VLC/3.0.20" -i "$IPTV_URL" -t 1 -c copy -f mpegts /tmp/pre.ts -y 2>&1 | tail -n 5
             set -e
 
             NOW=$(date +%s)
@@ -84,41 +78,29 @@ jobs:
 
             if ! is_online; then echo "直前オフライン"; continue; fi
 
-            echo "=== 録画開始 ==="
-            set +e
-            SECS=$((DUR * 60))
-            ffmpeg -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 30 -rw_timeout 15000000 -user_agent "VLC/3.0.20" -i "$IPTV_URL" -t $SECS -c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 96k -y rec.mp4
-            RET=$?
-            set -e
-            if [ $RET -ne 0 ]; then echo "失敗 code=$RET"; continue; fi
-
+            echo "recorder.ymlを起動 $JST"
+            # キュー削除はrecorderに任せる前にここで削除して競合防止
             jq --arg d "$JST" 'map(select(.jst_datetime != $d))' queue.json > new.json
             mv new.json queue.json
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add queue.json
-            git commit -m "dequeue $JST" || true
-            git push --quiet || true
+            git commit -m "dequeue $JST -> recorder" || true
+            git push --quiet || { echo "競合、スキップ"; continue; }
 
-            FILE="rec_$(echo $JST | sed 's/[^0-9]/_/g')_${DUR}m.mp4"
-            rclone copyto rec.mp4 r2:iptv-archive/videos/"$FILE" --quiet
-            rclone copyto r2:iptv-archive/manifest.json ./manifest.json 2>/dev/null || true
-            [ -f manifest.json ] || echo '{"videos":[]}' > manifest.json
-            URL="$R2_PUBLIC_URL/videos/$FILE"
-            jq --arg t "録画 $JST" --arg f "$FILE" --arg u "$URL" --arg d "$(date -Iseconds)" '.videos |= [{title:$t, filename:$f, url:$u, recorded_at:$d}] + .' manifest.json > new.json
-            mv new.json manifest.json
-            rclone copyto ./manifest.json r2:iptv-archive/manifest.json --quiet
+            # recorder.ymlをdispatch
+            curl -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/${{ github.repository }}/actions/workflows/recorder.yml/dispatches \
+              -d "{\"ref\":\"main\", \"inputs\":{\"jst_datetime\":\"$JST\", \"duration_minutes\":\"$DUR\"}}"
+
+            echo "recorder起動完了、監視継続"
           done
-          echo "10分監視終了"
 
       - name: 次のCheckerを自動起動
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "次のcheckerをdispatch..."
-          curl -X POST \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
+          curl -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" \
             https://api.github.com/repos/${{ github.repository }}/actions/workflows/checker.yml/dispatches \
             -d '{"ref":"main"}' || true
