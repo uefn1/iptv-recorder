@@ -2,13 +2,122 @@ name: Reserve
 on:
   workflow_dispatch:
     inputs:
-      jst_datetime:
-        description: 'JST 2026-10-20 18:42 形式'
+      year:
+        description: '年'
         required: true
+        default: '2026'
+        type: choice
+        options:
+          - '2026'
+          - '2027'
+      month:
+        description: '月'
+        required: true
+        default: '05'
+        type: choice
+        options:
+          - '01'
+          - '02'
+          - '03'
+          - '04'
+          - '05'
+          - '06'
+          - '07'
+          - '08'
+          - '09'
+          - '10'
+          - '11'
+          - '12'
+      day:
+        description: '日'
+        required: true
+        type: choice
+        default: '13'
+        options:
+          - '01'
+          - '02'
+          - '03'
+          - '04'
+          - '05'
+          - '06'
+          - '07'
+          - '08'
+          - '09'
+          - '10'
+          - '11'
+          - '12'
+          - '13'
+          - '14'
+          - '15'
+          - '16'
+          - '17'
+          - '18'
+          - '19'
+          - '20'
+          - '21'
+          - '22'
+          - '23'
+          - '24'
+          - '25'
+          - '26'
+          - '27'
+          - '28'
+          - '29'
+          - '30'
+          - '31'
+      hour:
+        description: '時 (JST)'
+        required: true
+        default: '20'
+        type: choice
+        options:
+          - '00'
+          - '01'
+          - '02'
+          - '03'
+          - '04'
+          - '05'
+          - '06'
+          - '07'
+          - '08'
+          - '09'
+          - '10'
+          - '11'
+          - '12'
+          - '13'
+          - '14'
+          - '15'
+          - '16'
+          - '17'
+          - '18'
+          - '19'
+          - '20'
+          - '21'
+          - '22'
+          - '23'
+      minute:
+        description: '分'
+        required: true
+        default: '00'
+        type: choice
+        options:
+          - '00'
+          - '05'
+          - '10'
+          - '15'
+          - '20'
+          - '25'
+          - '30'
+          - '35'
+          - '40'
+          - '45'
+          - '50'
+          - '55'
       duration_minutes:
-        description: '録画分数'
+        description: '録画分数を手入力 (例: 73)'
         required: true
         default: '60'
+        type: string
 
 permissions:
   contents: write
@@ -23,10 +132,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: |
-          sudo apt-get install -y jq -qq
           [ -f queue.json ] || echo '[]' > queue.json
-          JST="${{ inputs.jst_datetime }}"
+          JST="${{ inputs.year }}-${{ inputs.month }}-${{ inputs.day }} ${{ inputs.hour }}:${{ inputs.minute }}"
           DUR="${{ inputs.duration_minutes }}"
+          echo "予約 $JST ${DUR}分"
           jq --arg d "$JST" --argjson m "$DUR" '. += [{jst_datetime:$d, duration_minutes:$m}] | sort_by(.jst_datetime)' queue.json > new.json
           mv new.json queue.json
           cat queue.json
