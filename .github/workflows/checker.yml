@@ -13,27 +13,21 @@ permissions:
 
 jobs:
   watch:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - name: 10分監視 + recorder起動
+      - name: 10分監視
         env:
-          IPTV_URL: ${{ secrets.IPTV_URL }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          sudo apt-get install -y ffmpeg jq curl -qq
+          sudo apt-get install -y jq -qq
           START=$(date +%s)
           END=$((START + 600))
-
-          is_online() {
-            CODE=$(curl -L -s -o /dev/null -w "%{http_code}" -A "VLC/3.0.20" "$IPTV_URL" --max-time 10)
-            [ "$CODE" = "200" ]
-          }
 
           while [ $(date +%s) -lt $END ]; do
             git fetch origin main --quiet
@@ -41,10 +35,10 @@ jobs:
             [ -f queue.json ] || echo '[]' > queue.json
             NOW=$(date +%s)
 
-            # 期限切れ削除
             TMP_Q="[]"
             jq -c '.[]' queue.json > /tmp/rows.txt || true
             while IFS= read -r row; do
+              [ -z "$row" ] && continue
               JST=$(echo "$row" | jq -r .jst_datetime)
               TARGET=$(TZ=Asia/Tokyo date -d "$JST" +%s 2>/dev/null || echo 0)
               if [ $((NOW - TARGET)) -ge 600 ]; then echo "expired $JST"; else TMP_Q=$(echo "$TMP_Q" | jq --argjson r "$row" '. += [$r]'); fi
@@ -63,44 +57,24 @@ jobs:
 
             JST=$(echo "$FOUND" | jq -r .jst_datetime)
             DUR=$(echo "$FOUND" | jq -r .duration_minutes)
-            echo ">>> 5分前検知 $JST ${DUR}分"
+            echo ">>> 5分前検知 $JST -> recorder起動"
 
-            # .ts先行取得
-            set +e
-            if ! is_online; then echo "オフライン"; sleep 60; continue; fi
-            timeout 20 ffmpeg -reconnect 1 -rw_timeout 10000000 -user_agent "VLC/3.0.20" -i "$IPTV_URL" -t 1 -c copy -f mpegts /tmp/pre.ts -y 2>&1 | tail -n 5
-            set -e
-
-            NOW=$(date +%s)
-            TARGET=$(TZ=Asia/Tokyo date -d "$JST" +%s)
-            SLEEP_SEC=$((TARGET - NOW - 1))
-            [ $SLEEP_SEC -gt 0 ] && sleep $SLEEP_SEC
-
-            if ! is_online; then echo "直前オフライン"; continue; fi
-
-            echo "recorder.ymlを起動 $JST"
-            # キュー削除はrecorderに任せる前にここで削除して競合防止
-            jq --arg d "$JST" 'map(select(.jst_datetime != $d))' queue.json > new.json
-            mv new.json queue.json
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
+            jq --arg d "$JST" 'map(select(.jst_datetime != $d))' queue.json > new.json
+            mv new.json queue.json
             git add queue.json
             git commit -m "dequeue $JST -> recorder" || true
-            git push --quiet || { echo "競合、スキップ"; continue; }
+            git push --quiet || continue
 
-            # recorder.ymlをdispatch
-            curl -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" \
-              https://api.github.com/repos/${{ github.repository }}/actions/workflows/recorder.yml/dispatches \
-              -d "{\"ref\":\"main\", \"inputs\":{\"jst_datetime\":\"$JST\", \"duration_minutes\":\"$DUR\"}}"
-
-            echo "recorder起動完了、監視継続"
+            echo "$GH_TOKEN" | gh auth login --with-token
+            gh workflow run recorder.yml --ref main --field jst_datetime="$JST" --field duration_minutes="$DUR"
           done
 
-      - name: 次のCheckerを自動起動
+      - name: 次のChecker自動起動
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          curl -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/checker.yml/dispatches \
-            -d '{"ref":"main"}' || true
+          echo "$GH_TOKEN" | gh auth login --with-token
+          gh workflow run checker.yml --ref main || true
