@@ -1,0 +1,57 @@
+name: Recorder
+on:
+  workflow_dispatch:
+    inputs:
+      jst_datetime:
+        required: true
+      duration_minutes:
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: iptv-record
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+      - name: Record
+        env:
+          IPTV_URL: ${{ secrets.IPTV_URL }}
+          R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
+          R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
+          JST: ${{ inputs.jst_datetime }}
+          DUR: ${{ inputs.duration_minutes }}
+        run: |
+          set -e
+          sudo apt-get install -y ffmpeg jq -qq
+          curl -s https://rclone.org/install.sh | sudo bash
+          rclone config create r2 s3 provider Cloudflare access_key_id "$(echo "$R2_ACCESS_KEY" | tr -d '[:space:]')" secret_access_key "$(echo "$R2_SECRET_KEY" | tr -d '[:space:]')" endpoint "https://$(echo "$R2_ACCOUNT_ID" | tr -d '[:space:]').r2.cloudflarestorage.com" region auto --quiet
+
+          echo "=== 録画開始 $JST ${DUR}分 ==="
+          SECS=$((DUR * 60))
+          set +e
+          for i in 1 2 3 4 5; do
+            ffmpeg -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 30 -rw_timeout 15000000 -user_agent "VLC/3.0.20" -i "$IPTV_URL" -t $SECS -c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 96k -y rec.mp4
+            [ $? -eq 0 ] && break
+            echo "リトライ $i/5"
+            sleep 10
+          done
+          set -e
+          [ -f rec.mp4 ] || exit 1
+
+          FILE="rec_$(echo $JST | sed 's/[^0-9]/_/g')_${DUR}m.mp4"
+          rclone copyto rec.mp4 r2:iptv-archive/videos/"$FILE" --quiet
+          rclone copyto r2:iptv-archive/manifest.json ./manifest.json 2>/dev/null || true
+          [ -f manifest.json ] || echo '{"videos":[]}' > manifest.json
+          URL="$R2_PUBLIC_URL/videos/$FILE"
+          jq --arg t "録画 $JST ${DUR}分" --arg f "$FILE" --arg u "$URL" --arg d "$(date -Iseconds)" '.videos |= [{title:$t, filename:$f, url:$u, recorded_at:$d}] + .' manifest.json > new.json
+          mv new.json manifest.json
+          rclone copyto ./manifest.json r2:iptv-archive/manifest.json --quiet
