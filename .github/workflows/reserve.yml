@@ -1,0 +1,37 @@
+name: Reserve
+on:
+  workflow_dispatch:
+    inputs:
+      jst_datetime:
+        description: 'JST 2026-10-20 18:42 形式'
+        required: true
+      duration_minutes:
+        description: '録画分数'
+        required: true
+        default: '60'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: queue-edit
+  cancel-in-progress: false
+
+jobs:
+  add:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: |
+          sudo apt-get install -y jq -qq
+          [ -f queue.json ] || echo '[]' > queue.json
+          JST="${{ inputs.jst_datetime }}"
+          DUR="${{ inputs.duration_minutes }}"
+          jq --arg d "$JST" --argjson m "$DUR" '. += [{jst_datetime:$d, duration_minutes:$m}] | sort_by(.jst_datetime)' queue.json > new.json
+          mv new.json queue.json
+          cat queue.json
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add queue.json
+          git commit -m "reserve $JST ${DUR}m" || true
+          git push
