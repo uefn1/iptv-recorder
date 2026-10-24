@@ -20,7 +20,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_KEY }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
-          R2_BUCKET: recorder
+          R2_BUCKET: iptv-archive
         run: |
           set +e
           shopt -s nullglob
@@ -44,24 +44,16 @@ jobs:
             BEST=$(ls -S /tmp/work/${ID}_*.ts 2>/dev/null | head -n1)
             if [ ! -s "$BEST" ]; then echo "録画失敗"; continue; fi
             cp -f "$BEST" /tmp/work/${ID}_best.ts
-
-            # --- CUT計算を安全に ---
             RAW="/tmp/work/${ID}_best.ts"
+
             PTS=$(ffprobe -v error -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 "$RAW" | head -n1 | tr -d '\r')
-            # 数値以外なら0にする
             if ! echo "$PTS" | grep -Eq '^[0-9.]+$'; then PTS=0; fi
-            
             MTIME=$(stat -c %Y "$RAW")
-            OFFSET=$(( MTIME - START ))
-            [ $OFFSET -lt 0 ] && OFFSET=0
-            [ $OFFSET -gt 30 ] && OFFSET=30
-            
+            OFFSET=$(( MTIME - START )); [ $OFFSET -lt 0 ] && OFFSET=0; [ $OFFSET -gt 30 ] && OFFSET=30
             CUT=$(awk -v o=$OFFSET -v p=$PTS 'BEGIN{print o+p}')
             if ! echo "$CUT" | grep -Eq '^[0-9.]+$'; then CUT=0; fi
-
             echo "PTS=$PTS OFFSET=$OFFSET CUT=$CUT"
 
-            # --- エンコード ---
             ffmpeg -y -ss $CUT -i "$RAW" -t "$DUR" -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k /tmp/work/${ID}.mp4
             ffmpeg -y -ss $CUT -i "$RAW" -t "$DUR" -c copy /tmp/work/${ID}.ts
 
@@ -69,7 +61,13 @@ jobs:
 
             aws s3 cp /tmp/work/${ID}.mp4 s3://${R2_BUCKET}/recordings/${ID}.mp4 --endpoint-url $ENDPOINT
             aws s3 cp /tmp/work/${ID}.ts s3://${R2_BUCKET}/recordings/${ID}.ts --endpoint-url $ENDPOINT
-            echo "DONE -> ${R2_PUBLIC_URL}/recordings/${ID}.mp4"
+            
+            if [ $? -eq 0 ]; then
+              echo "DONE -> ${R2_PUBLIC_URL}/recordings/${ID}.mp4"
+            else
+              echo "UPLOAD FAILED"
+              exit 1
+            fi
             rm -f /tmp/work/${ID}_*
           done
 
