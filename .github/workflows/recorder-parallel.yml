@@ -14,13 +14,13 @@ jobs:
           sudo apt-get update && sudo apt-get install -y ffmpeg jq -qq
           pip install awscli -q
 
-      - name: record + encode + upload to R2
+      - name: record + encode + upload
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_KEY }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
-          R2_BUCKET: recorder  # ← バケット名変えて
+          R2_BUCKET: recorder
         run: |
           set +e
           shopt -s nullglob
@@ -33,11 +33,8 @@ jobs:
             URL=$(jq -r .url $f)
             START=$(jq -r .start $f)
             DUR=$(jq -r .duration $f)
-            [ -z "$URL" ] || [ "$URL" = "null" ] && continue
 
-            echo "=== START $ID ch=$(jq -r .channel $f) dur=$DUR ==="
-            
-            # 1. 並列録画
+            echo "=== $ID ==="
             OPTS="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 60 -rw_timeout 15000000 -user_agent Mozilla/5.0"
             ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy /tmp/work/${ID}_a.ts &
             ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy /tmp/work/${ID}_b.ts &
@@ -45,27 +42,34 @@ jobs:
             wait
 
             BEST=$(ls -S /tmp/work/${ID}_*.ts 2>/dev/null | head -n1)
-            if [ -z "$BEST" ]; then echo "録画失敗 $ID"; continue; fi
+            if [ ! -s "$BEST" ]; then echo "録画失敗"; continue; fi
             cp -f "$BEST" /tmp/work/${ID}_best.ts
 
-            # 2. エンコード (rawから直接)
-            FIRST_PTS=$(ffprobe -v error -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 /tmp/work/${ID}_best.ts | head -n1)
-            [ -z "$FIRST_PTS" ] && FIRST_PTS=0
-            MTIME=$(stat -c %Y /tmp/work/${ID}_best.ts)
-            OFFSET=$(( MTIME - START )); [ $OFFSET -lt 0 ] && OFFSET=0
-            CUT=$(awk "BEGIN{print $OFFSET + $FIRST_PTS}")
-            echo "CUT $CUT OFFSET $OFFSET PTS $FIRST_PTS"
+            # --- CUT計算を安全に ---
+            RAW="/tmp/work/${ID}_best.ts"
+            PTS=$(ffprobe -v error -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 "$RAW" | head -n1 | tr -d '\r')
+            # 数値以外なら0にする
+            if ! echo "$PTS" | grep -Eq '^[0-9.]+$'; then PTS=0; fi
+            
+            MTIME=$(stat -c %Y "$RAW")
+            OFFSET=$(( MTIME - START ))
+            [ $OFFSET -lt 0 ] && OFFSET=0
+            [ $OFFSET -gt 30 ] && OFFSET=30
+            
+            CUT=$(awk -v o=$OFFSET -v p=$PTS 'BEGIN{print o+p}')
+            if ! echo "$CUT" | grep -Eq '^[0-9.]+$'; then CUT=0; fi
 
-            ffmpeg -y -ss $CUT -i /tmp/work/${ID}_best.ts -t "$DUR" -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k /tmp/work/${ID}.mp4
-            ffmpeg -y -ss $CUT -i /tmp/work/${ID}_best.ts -t "$DUR" -c copy /tmp/work/${ID}.ts
+            echo "PTS=$PTS OFFSET=$OFFSET CUT=$CUT"
 
-            # 3. R2にアップロード
+            # --- エンコード ---
+            ffmpeg -y -ss $CUT -i "$RAW" -t "$DUR" -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k /tmp/work/${ID}.mp4
+            ffmpeg -y -ss $CUT -i "$RAW" -t "$DUR" -c copy /tmp/work/${ID}.ts
+
+            if [ ! -f /tmp/work/${ID}.mp4 ]; then echo "mp4生成失敗"; ls -lh /tmp/work/; continue; fi
+
             aws s3 cp /tmp/work/${ID}.mp4 s3://${R2_BUCKET}/recordings/${ID}.mp4 --endpoint-url $ENDPOINT
             aws s3 cp /tmp/work/${ID}.ts s3://${R2_BUCKET}/recordings/${ID}.ts --endpoint-url $ENDPOINT
-
             echo "DONE -> ${R2_PUBLIC_URL}/recordings/${ID}.mp4"
-
-            # 4. ローカル掃除
             rm -f /tmp/work/${ID}_*
           done
 
@@ -75,6 +79,6 @@ jobs:
           git config user.name "uefn1"
           git config user.email "uefn1@users.noreply.github.com"
           git add -A
-          git commit -m "record done r2 [skip ci]" || true
+          git commit -m "record done [skip ci]" || true
           git pull --rebase origin main
           git push origin main || true
