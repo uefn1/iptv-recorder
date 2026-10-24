@@ -5,49 +5,28 @@ on:
       id:
         required: true
         type: string
-
 permissions:
   contents: write
-
 jobs:
   encode:
     runs-on: ubuntu-latest
     timeout-minutes: 200
     steps:
       - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - run: sudo apt-get update && sudo apt-get install -y ffmpeg jq
-
-      - name: cut and encode
+      - run: sudo apt-get install -y ffmpeg jq -qq
+      - name: encode
         run: |
-          ID="${{ inputs.id }}"
-          RAW="recordings/raw/${ID}_best.ts"
-          QUEUE="queue/${ID}.json"
-          START=$(jq -r .start $QUEUE)
-          DUR=$(jq -r .duration $QUEUE)
-
-          FIRST_PTS=$(ffprobe -v error -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 "$RAW" | head -n1)
-          [ -z "$FIRST_PTS" ] && FIRST_PTS=0
-          FILE_MTIME=$(stat -c %Y "$RAW")
-          OFFSET=$(( FILE_MTIME - START ))
-          [ $OFFSET -lt 0 ] && OFFSET=0
-          CUT_START=$(awk "BEGIN{print $OFFSET + $FIRST_PTS}")
-
+          ID="${{ inputs.id }}"; RAW="recordings/raw/${ID}_best.ts"; QUEUE="queue/${ID}.json"
+          START=$(jq -r .start $QUEUE); DUR=$(jq -r .duration $QUEUE)
+          FIRST_PTS=$(ffprobe -v error -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 "$RAW" | head -n1); [ -z "$FIRST_PTS" ] && FIRST_PTS=0
+          MTIME=$(stat -c %Y "$RAW"); OFFSET=$(( MTIME - START )); [ $OFFSET -lt 0 ] && OFFSET=0
+          CUT=$(awk "BEGIN{print $OFFSET + $FIRST_PTS}")
           mkdir -p recordings
-          # カット + エンコード (録画完了後なので重くてもOK)
-          ffmpeg -y -ss $CUT_START -i "$RAW" -t "$DUR" -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k "recordings/${ID}.mp4"
-          # 元のtsも時刻照合カット版を残したいなら
-          ffmpeg -y -ss $CUT_START -i "$RAW" -t "$DUR" -c copy "recordings/${ID}.ts"
-
+          ffmpeg -y -ss $CUT -i "$RAW" -t "$DUR" -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k recordings/${ID}.mp4
+          ffmpeg -y -ss $CUT -i "$RAW" -t "$DUR" -c copy recordings/${ID}.ts
       - name: cleanup
         run: |
-          ID="${{ inputs.id }}"
-          rm -rf recordings/raw/${ID}_*.ts
-          rm -f queue/${ID}.json
-          git config user.name "uefn1"
-          git config user.email "uefn1@users.noreply.github.com"
-          git add -A
-          git commit -m "encode done $ID [skip ci]" || exit 0
-          git pull --rebase origin main
-          git push origin main
+          ID="${{ inputs.id }}"; rm -rf recordings/raw/${ID}_best.ts; rm -f queue/${ID}.json
+          git config user.name "uefn1"; git config user.email "uefn1@users.noreply.github.com"
+          git add -A; git commit -m "encode $ID [skip ci]" || true
+          git pull --rebase origin main; git push origin main || true
