@@ -4,6 +4,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   record:
@@ -13,39 +14,94 @@ jobs:
       - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-      - run: sudo apt-get update && sudo apt-get install -y ffmpeg jq
+
+      - name: install
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg jq
 
       - name: parallel recording
         run: |
+          set +e
+          shopt -s nullglob
           mkdir -p recordings/raw
           URL=$(jq -r .url config.json 2>/dev/null || echo "${{ secrets.M3U_URL }}")
+          echo "URL: ${URL:0:100}..."
+
+          > /tmp/done.txt
+
           for f in queue/*.json; do
             [ -e "$f" ] || continue
             ID=$(jq -r .id $f)
-            DUR=$(jq -r .duration $f)
+            DUR=$(jq -r .duration $f 2>/dev/null)
+            [ -z "$DUR" ] && DUR=3600
+
+            echo "=== $ID 取得開始 dur=$DUR ==="
             OPTS="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 60 -rw_timeout 15000000"
-            ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy "recordings/raw/${ID}_a.ts" &
-            ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy "recordings/raw/${ID}_b.ts" &
-            ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy "recordings/raw/${ID}_c.ts" &
-            wait
-            # 最良を選ぶ
-            BEST=$(ls -S recordings/raw/${ID}_*.ts | head -n1)
-            cp "$BEST" "recordings/raw/${ID}_best.ts"
+
+            rm -f recordings/raw/${ID}_*.ts
+
+            ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy "recordings/raw/${ID}_a.ts" 2> /tmp/a.log &
+            P1=$!
+            ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy "recordings/raw/${ID}_b.ts" 2> /tmp/b.log &
+            P2=$!
+            ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy "recordings/raw/${ID}_c.ts" 2> /tmp/c.log &
+            P3=$!
+
+            wait $P1; echo "a exit:$?"
+            wait $P2; echo "b exit:$?"
+            wait $P3; echo "c exit:$?"
+
+            ls -lh recordings/raw/${ID}_* 2>&1 || echo "no files for $ID"
+
+            # 一番大きいファイルを採用
+            BEST=""
+            BEST_SIZE=0
+            for cand in recordings/raw/${ID}_a.ts recordings/raw/${ID}_b.ts recordings/raw/${ID}_c.ts; do
+              if [ -f "$cand" ]; then
+                SIZE=$(stat -c%s "$cand" 2>/dev/null || echo 0)
+                if [ $SIZE -gt 1024 ]; then
+                  if ffprobe -v error "$cand" > /dev/null 2>&1; then
+                    echo "$cand OK size=$SIZE"
+                    if [ $SIZE -gt $BEST_SIZE ]; then
+                      BEST_SIZE=$SIZE
+                      BEST=$cand
+                    fi
+                  fi
+                fi
+              fi
+            done
+
+            if [ -z "$BEST" ]; then
+              echo "WARN: 全滅 $ID -> スキップ"
+              cat /tmp/a.log | tail -n 20
+              continue
+            fi
+
+            echo "採用: $BEST size=$BEST_SIZE"
+            cp -f "$BEST" "recordings/raw/${ID}_best.ts"
             rm -f recordings/raw/${ID}_a.ts recordings/raw/${ID}_b.ts recordings/raw/${ID}_c.ts
             echo "$ID" >> /tmp/done.txt
           done
+
+          echo "完了リスト:"
+          cat /tmp/done.txt || echo "none"
 
       - name: push raw and trigger encode
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          shopt -s nullglob
+          if [ -f /tmp/done.txt ]; then
+            for ID in $(cat /tmp/done.txt); do
+              if [ -f "recordings/raw/${ID}_best.ts" ]; then
+                echo "trigger encoder for $ID"
+                gh workflow run encoder.yml -f id=$ID || true
+              fi
+            done
+          fi
+
           git config user.name "uefn1"
           git config user.email "uefn1@users.noreply.github.com"
-          git add recordings/raw/ queue/
-          git commit -m "raw done [skip ci]" || exit 0
-          git pull --rebase origin main
-          git push origin main
-          # エンコードymlを起動
-          for ID in $(cat /tmp/done.txt); do
-            gh workflow run encoder.yml -f id=$ID
-          done
+          git add recordings/raw/ queue/ 2>/dev/null || true
+          git commit -m "raw done [skip ci]" || echo "nothing to commit"
+          git pull --rebase origin main || true
+          git push origin main || true
