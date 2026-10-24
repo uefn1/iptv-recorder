@@ -1,80 +1,32 @@
-name: Checker
+name: checker
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: "* * * * *"
   workflow_dispatch:
-  push:
-    paths:
-      - queue.json
-
-permissions:
-  contents: write
-  actions: write
 
 jobs:
-  watch:
+  check:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    concurrency:
+      group: checker-queue
+      cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: 10分監視
+      - uses: actions/checkout@v4
+      - name: trigger recorders in parallel
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
-          sudo apt-get install -y jq -qq
-          START=$(date +%s)
-          END=$((START + 600))
-
-          while [ $(date +%s) -lt $END ]; do
-            git fetch origin main --quiet
-            git reset --hard origin/main --quiet
-            [ -f queue.json ] || echo '[]' > queue.json
-            NOW=$(date +%s)
-
-            TMP_Q="[]"
-            jq -c '.[]' queue.json > /tmp/rows.txt || true
-            while IFS= read -r row; do
-              [ -z "$row" ] && continue
-              JST=$(echo "$row" | jq -r .jst_datetime)
-              TARGET=$(TZ=Asia/Tokyo date -d "$JST" +%s 2>/dev/null || echo 0)
-              if [ $((NOW - TARGET)) -ge 600 ]; then echo "expired $JST"; else TMP_Q=$(echo "$TMP_Q" | jq --argjson r "$row" '. += [$r]'); fi
-            done < /tmp/rows.txt
-            echo "$TMP_Q" > queue.json
-
-            FOUND=""
-            while IFS= read -r row; do
-              JST=$(echo "$row" | jq -r .jst_datetime)
-              TARGET=$(TZ=Asia/Tokyo date -d "$JST" +%s)
-              REMAIN=$((TARGET - NOW))
-              if [ $REMAIN -le 300 ] && [ $REMAIN -ge -60 ]; then FOUND="$row"; break; fi
-            done < /tmp/rows.txt
-
-            if [ -z "$FOUND" ]; then sleep 30; continue; fi
-
-            JST=$(echo "$FOUND" | jq -r .jst_datetime)
-            DUR=$(echo "$FOUND" | jq -r .duration_minutes)
-            echo ">>> 5分前検知 $JST -> recorder起動"
-
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            jq --arg d "$JST" 'map(select(.jst_datetime != $d))' queue.json > new.json
-            mv new.json queue.json
-            git add queue.json
-            git commit -m "dequeue $JST -> recorder" || true
-            git push --quiet || continue
-
-            # GH_TOKENがあればログイン不要、そのままghで起動
-            gh workflow run recorder.yml --ref main --field jst_datetime="$JST" --field duration_minutes="$DUR"
-            echo "recorder起動完了"
+          sudo apt-get update && sudo apt-get install -y jq
+          NOW=$(date +%s)
+          for f in queue/*.json; do
+            [ -e "$f" ] || continue
+            ID=$(jq -r .id $f)
+            URL=$(jq -r .url $f)
+            DUR=$(jq -r .duration $f)
+            START=$(jq -r .start $f)
+            if [ $START -le $NOW ]; then
+              echo "trigger $ID"
+              gh workflow run recorder.yml -f id=$ID -f url=$URL -f duration=$DUR
+              sleep 1
+            fi
           done
-
-      - name: 次のChecker自動起動
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh workflow run checker.yml --ref main || true
