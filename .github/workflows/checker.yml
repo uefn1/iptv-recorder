@@ -4,6 +4,9 @@ on:
     - cron: "* * * * *"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -12,21 +15,24 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
-      - name: trigger recorders in parallel
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: trigger parallel recorder
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          sudo apt-get update && sudo apt-get install -y jq
+          sudo apt-get install -y jq > /dev/null
           NOW=$(date +%s)
+          DUE=0
           for f in queue/*.json; do
             [ -e "$f" ] || continue
-            ID=$(jq -r .id $f)
-            URL=$(jq -r .url $f)
-            DUR=$(jq -r .duration $f)
             START=$(jq -r .start $f)
             if [ $START -le $NOW ]; then
-              echo "trigger $ID"
-              gh workflow run recorder.yml -f id=$ID -f url=$URL -f duration=$DUR
-              sleep 1
+              DUE=$((DUE+1))
             fi
           done
+          if [ $DUE -gt 0 ]; then
+            echo "$DUE件 期限到来 -> recorder-parallelを起動"
+            gh workflow run recorder-parallel.yml
+          fi
