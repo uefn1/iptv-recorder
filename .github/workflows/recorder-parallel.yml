@@ -3,7 +3,6 @@ on:
   workflow_dispatch:
 permissions:
   contents: write
-  actions: write
 jobs:
   record:
     runs-on: ubuntu-latest
@@ -15,35 +14,67 @@ jobs:
           sudo apt-get update && sudo apt-get install -y ffmpeg jq -qq
           pip install awscli -q
 
-      - name: recording + upload to R2
+      - name: record + encode + upload to R2
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_KEY }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_BUCKET: recorder  # ← あなたのバケット名に変えて
+          R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
+          R2_BUCKET: recorder  # ← バケット名変えて
         run: |
-          set +e; shopt -s nullglob; mkdir -p /tmp/raw; > /tmp/done.txt
+          set +e
+          shopt -s nullglob
+          mkdir -p /tmp/work
           ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
           for f in queue/*.json; do
             [ -e "$f" ] || continue
-            ID=$(jq -r .id $f); URL=$(jq -r .url $f); DUR=$(jq -r .duration $f)
-            [ -z "$URL" ] && continue
-            echo "=== $ID ==="
+            ID=$(jq -r .id $f)
+            URL=$(jq -r .url $f)
+            START=$(jq -r .start $f)
+            DUR=$(jq -r .duration $f)
+            [ -z "$URL" ] || [ "$URL" = "null" ] && continue
+
+            echo "=== START $ID ch=$(jq -r .channel $f) dur=$DUR ==="
+            
+            # 1. 並列録画
             OPTS="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 60 -rw_timeout 15000000 -user_agent Mozilla/5.0"
-            ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy /tmp/raw/${ID}_a.ts &
-            ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy /tmp/raw/${ID}_b.ts &
-            ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy /tmp/raw/${ID}_c.ts &
+            ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy /tmp/work/${ID}_a.ts &
+            ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy /tmp/work/${ID}_b.ts &
+            ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy /tmp/work/${ID}_c.ts &
             wait
-            BEST=$(ls -S /tmp/raw/${ID}_*.ts 2>/dev/null | head -n1)
-            [ -z "$BEST" ] && continue
-            cp -f "$BEST" /tmp/raw/${ID}_best.ts
-            【entity-aws¦canonical_name=AWS】 s3 cp /tmp/raw/${ID}_best.ts s3://${R2_BUCKET}/raw/${ID}_best.ts --endpoint-url $ENDPOINT
-            echo "$ID" >> /tmp/done.txt
-            rm -f /tmp/raw/${ID}_*
+
+            BEST=$(ls -S /tmp/work/${ID}_*.ts 2>/dev/null | head -n1)
+            if [ -z "$BEST" ]; then echo "録画失敗 $ID"; continue; fi
+            cp -f "$BEST" /tmp/work/${ID}_best.ts
+
+            # 2. エンコード (rawから直接)
+            FIRST_PTS=$(ffprobe -v error -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 /tmp/work/${ID}_best.ts | head -n1)
+            [ -z "$FIRST_PTS" ] && FIRST_PTS=0
+            MTIME=$(stat -c %Y /tmp/work/${ID}_best.ts)
+            OFFSET=$(( MTIME - START )); [ $OFFSET -lt 0 ] && OFFSET=0
+            CUT=$(awk "BEGIN{print $OFFSET + $FIRST_PTS}")
+            echo "CUT $CUT OFFSET $OFFSET PTS $FIRST_PTS"
+
+            ffmpeg -y -ss $CUT -i /tmp/work/${ID}_best.ts -t "$DUR" -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k /tmp/work/${ID}.mp4
+            ffmpeg -y -ss $CUT -i /tmp/work/${ID}_best.ts -t "$DUR" -c copy /tmp/work/${ID}.ts
+
+            # 3. R2にアップロード
+            aws s3 cp /tmp/work/${ID}.mp4 s3://${R2_BUCKET}/recordings/${ID}.mp4 --endpoint-url $ENDPOINT
+            aws s3 cp /tmp/work/${ID}.ts s3://${R2_BUCKET}/recordings/${ID}.ts --endpoint-url $ENDPOINT
+
+            echo "DONE -> ${R2_PUBLIC_URL}/recordings/${ID}.mp4"
+
+            # 4. ローカル掃除
+            rm -f /tmp/work/${ID}_*
           done
 
-      - name: trigger encoder
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: cleanup queue
         run: |
-          for ID in $(cat /tmp/done.txt 2>/dev/null); do gh workflow run encoder.yml -f id=$ID || true; done
+          rm -rf queue/*.json
+          git config user.name "uefn1"
+          git config user.email "uefn1@users.noreply.github.com"
+          git add -A
+          git commit -m "record done r2 [skip ci]" || true
+          git pull --rebase origin main
+          git push origin main || true
