@@ -1,0 +1,26 @@
+name: Clean contributors
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
+jobs:
+  clean:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+      - name: Remove outside collaborators
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          REPO: ${{ github.repository }}
+        run: |
+          ALLOWED_USERS="uefn1"
+          gh api repos/$REPO/collaborators --paginate --jq '.[].login' | while read user; do
+            if ! echo "$ALLOWED_USERS" | grep -qw "$user"; then
+              gh api -X DELETE repos/$REPO/collaborators/$user || true
+            fi
+          done
