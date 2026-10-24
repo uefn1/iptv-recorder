@@ -1,65 +1,36 @@
 name: checker
 on:
   workflow_dispatch:
-
 permissions:
   contents: write
   actions: write
-
 jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 30分間監視 (15分前なら録画開始)
+      - name: 30分監視
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          sudo apt-get update && sudo apt-get install -y jq > /dev/null
-          echo "checker開始: $(date -d '9 hours' '+%Y-%m-%d %H:%M:%S JST')"
-
-          # 30分 = 1800秒、30回ループ (1分ごとに確認)
+          sudo apt-get install -y jq -qq
           for i in $(seq 1 30); do
-            echo "--- check $i/30 $(date -u +%H:%M:%S) ---"
             NOW=$(date +%s)
-
             for f in queue/*.json; do
               [ -e "$f" ] || continue
-              ID=$(jq -r .id $f)
-              START=$(jq -r .start $f)
-              START_JST=$(jq -r .start_jst $f)
-
-              # 既にトリガー済みか
-              if [ -f "/tmp/triggered_${ID}" ]; then
-                continue
-              fi
-
+              ID=$(jq -r .id $f); START=$(jq -r .start $f)
+              [ -f "/tmp/triggered_${ID}" ] && continue
               DIFF=$(( START - NOW ))
-              # 15分前 = 900秒前 かつ まだ開始時刻を過ぎていない
               if [ $DIFF -le 900 ] && [ $DIFF -ge -60 ]; then
-                echo "15分前検知: $ID $START_JST (残り${DIFF}秒) -> recorder-parallel起動"
+                echo "15分前 $ID -> recorder起動"
                 gh workflow run recorder-parallel.yml
                 touch "/tmp/triggered_${ID}"
               fi
             done
-
-            # 最後以外は60秒待機
-            if [ $i -lt 30 ]; then
-              sleep 60
-              git pull --rebase origin main > /dev/null 2>&1 || true
-            fi
+            [ $i -lt 30 ] && sleep 60 && git pull --rebase origin main -q || true
           done
-
-          echo "30分監視終了"
-
-      - name: 次のcheckerを起動して終了
+      - name: 次のchecker起動
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "次のcheckerを起動"
-          gh workflow run checker.yml
-          echo "現在のプロセスは終了"
+        run: gh workflow run checker.yml
