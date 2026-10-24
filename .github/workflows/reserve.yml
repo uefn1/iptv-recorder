@@ -1,78 +1,50 @@
 name: reserve
-
 on:
   workflow_dispatch:
     inputs:
-      year:
-        description: "年 (例: 2026)"
+      channel:
+        description: 'チャンネル名 (config.jsonのkey)'
         required: true
         type: string
-      month:
-        description: "月 (1-12)"
+      id:
+        description: '録画ID'
         required: true
         type: string
-      day:
-        description: "日 (1-31)"
+      start_jst:
+        description: '開始 JST (2026-05-13 21:00)'
         required: true
-        type: string
-      hour:
-        description: "時 (0-23)"
-        required: true
-        type: string
-      minute:
-        description: "分 (0-59)"
-        required: true
-        default: "0"
         type: string
       duration:
-        description: "録画分数 (例: 60で1時間)"
+        description: '秒数'
         required: true
-        default: "60"
-        type: string
-
+        default: '3600'
+permissions:
+  contents: write
 jobs:
   reserve:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: add queue file
+      - name: create queue
         run: |
-          YEAR="${{ inputs.year }}"
-          MONTH=$(printf "%02d" ${{ inputs.month }})
-          DAY=$(printf "%02d" ${{ inputs.day }})
-          HOUR=$(printf "%02d" ${{ inputs.hour }})
-          MIN=$(printf "%02d" ${{ inputs.minute }})
-          
-          JST_STR="$YEAR-$MONTH-$DAY $HOUR:$MIN:00"
-          START_EPOCH=$(TZ=Asia/Tokyo date -d "$JST_STR" +%s)
-          DURATION_SEC=$(( ${{ inputs.duration }} * 60 ))
-
-          ID="${START_EPOCH}_$RANDOM"
+          sudo apt-get install -y jq -qq
+          CH="${{ inputs.channel }}"
+          URL=$(jq -r --arg ch "$CH" '.channels[$ch]' config.json)
+          if [ "$URL" = "null" ] || [ -z "$URL" ]; then echo "channel $CH not found"; jq -r '.channels | keys' config.json; exit 1; fi
+          START=$(TZ=Asia/Tokyo date -d "${{ inputs.start_jst }}" +%s)
           mkdir -p queue
-
-          cat > queue/${ID}.json <<EOF
-          {
-            "id": "$ID",
-            "start": $START_EPOCH,
-            "start_jst": "$JST_STR",
-            "duration": "$DURATION_SEC",
-            "duration_min": "${{ inputs.duration }}",
-            "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          }
-          EOF
-
-          cat queue/${ID}.json
-
+          jq -n --arg id "${{ inputs.id }}" --arg ch "$CH" --arg url "$URL" --argjson start "$START" --arg start_jst "${{ inputs.start_jst }}" --argjson duration "${{ inputs.duration }}" \
+            '{id:$id, channel:$ch, url:$url, start:$start, start_jst:$start_jst, duration:$duration}' > queue/${{ inputs.id }}.json
+          cat queue/${{ inputs.id }}.json
+      - name: push
+        run: |
           git config user.name "uefn1"
           git config user.email "uefn1@users.noreply.github.com"
-          git add queue/${ID}.json
-          git commit -m "reserve $JST_STR ${{ inputs.duration }}min [skip ci]"
+          git add queue/
+          git commit -m "reserve ${{ inputs.id }} ${{ inputs.channel }} [skip ci]" || exit 0
           git pull --rebase origin main
           git push origin main
-
-      - name: summary
-        run: |
-          echo "### 予約完了" >> $GITHUB_STEP_SUMMARY
-          echo "- 開始: ${{ inputs.year }}/${{ inputs.month }}/${{ inputs.day }} ${{ inputs.hour }}:${{ inputs.minute }} JST" >> $GITHUB_STEP_SUMMARY
-          echo "- 録画: ${{ inputs.duration }}分" >> $GITHUB_STEP_SUMMARY
+      - name: ensure checker
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run checker.yml || true
