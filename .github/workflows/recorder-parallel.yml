@@ -1,109 +1,41 @@
 name: recorder-parallel
 on:
   workflow_dispatch:
-
 permissions:
   contents: write
   actions: write
-
 jobs:
   record:
     runs-on: ubuntu-latest
     timeout-minutes: 400
     steps:
       - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: install
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg jq
-
-      - name: debug url
-        run: |
-          echo "config.json:"
-          cat config.json 2>&1 || echo "no config.json"
-          echo "secret exists: $([ -n "${{ secrets.M3U_URL }}" ] && echo yes || echo no)"
-
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg jq -qq
       - name: parallel recording
         run: |
-          set +e
-          shopt -s nullglob
-          mkdir -p recordings/raw
-          
-          URL=$(jq -r .url config.json 2>/dev/null)
-          if [ "$URL" = "null" ] || [ -z "$URL" ]; then
-            URL="${{ secrets.M3U_URL }}"
-          fi
-
-          if [ -z "$URL" ]; then
-            echo "ERROR: URLが空です。config.jsonかSecrets.M3U_URLを設定してください"
-            exit 1
-          fi
-
-          echo "使用URL: ${URL:0:120}..."
-
-          > /tmp/done.txt
-
+          set +e; shopt -s nullglob; mkdir -p recordings/raw; > /tmp/done.txt
           for f in queue/*.json; do
             [ -e "$f" ] || continue
-            ID=$(jq -r .id $f)
-            DUR=$(jq -r .duration $f)
-            echo "=== 録画 $ID ${DUR}秒 ==="
-
-            # m3u8用の安定オプション
-            COMMON="-y -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 60 -rw_timeout 15000000 -user_agent Mozilla/5.0"
-
-            ffmpeg $COMMON -i "$URL" -t "$DUR" -c copy recordings/raw/${ID}_a.ts 2>&1 | tail -n 20 &
-            P1=$!
-            ffmpeg $COMMON -i "$URL" -t "$DUR" -c copy recordings/raw/${ID}_b.ts 2>&1 | tail -n 20 &
-            P2=$!
-            ffmpeg $COMMON -i "$URL" -t "$DUR" -c copy recordings/raw/${ID}_c.ts 2>&1 | tail -n 20 &
-            P3=$!
-
-            wait $P1; R1=$?
-            wait $P2; R2=$?
-            wait $P3; R3=$?
-            echo "exit codes: $R1 $R2 $R3"
-
-            ls -lh recordings/raw/${ID}_* || echo "ファイル無し"
-
-            BEST=""
-            BEST_SIZE=0
-            for cand in recordings/raw/${ID}_*.ts; do
-              [ -f "$cand" ] || continue
-              SIZE=$(stat -c%s "$cand" 2>/dev/null || echo 0)
-              echo "check $cand size=$SIZE"
-              if [ $SIZE -gt 10000 ]; then
-                BEST_SIZE=$SIZE
-                BEST=$cand
-              fi
-            done
-
-            if [ -z "$BEST" ]; then
-              echo "失敗: $ID は全滅"
-              continue
-            fi
-
+            ID=$(jq -r .id $f); URL=$(jq -r .url $f); DUR=$(jq -r .duration $f)
+            [ -z "$URL" ] || [ "$URL" = "null" ] && continue
+            echo "=== $ID $DUR sec ch=$(jq -r .channel $f) ==="
+            OPTS="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 60 -rw_timeout 15000000 -user_agent Mozilla/5.0"
+            ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy recordings/raw/${ID}_a.ts &
+            ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy recordings/raw/${ID}_b.ts &
+            ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy recordings/raw/${ID}_c.ts &
+            wait
+            BEST=$(ls -S recordings/raw/${ID}_*.ts 2>/dev/null | head -n1)
+            [ -z "$BEST" ] && echo "fail $ID" && continue
             cp -f "$BEST" recordings/raw/${ID}_best.ts
             rm -f recordings/raw/${ID}_a.ts recordings/raw/${ID}_b.ts recordings/raw/${ID}_c.ts
-            echo "成功: $BEST -> ${ID}_best.ts"
             echo "$ID" >> /tmp/done.txt
           done
-
-      - name: push and trigger encoder
+      - name: push and trigger
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cat /tmp/done.txt || echo "no done"
-          git config user.name "uefn1"
-          git config user.email "uefn1@users.noreply.github.com"
-          git add -f recordings/raw/ || true
-          git add queue/ || true
-          git commit -m "raw done [skip ci]" || true
-          git pull --rebase origin main || true
-          git push origin main || true
-
-          for ID in $(cat /tmp/done.txt 2>/dev/null); do
-            echo "trigger encoder $ID"
-            gh workflow run encoder.yml -f id=$ID || true
-          done
+          git config user.name "uefn1"; git config user.email "uefn1@users.noreply.github.com"
+          git add -f recordings/raw/; git commit -m "raw done [skip ci]" || true
+          git pull --rebase origin main; git push origin main || true
+          for ID in $(cat /tmp/done.txt 2>/dev/null); do gh workflow run encoder.yml -f id=$ID || true; done
