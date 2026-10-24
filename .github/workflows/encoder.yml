@@ -13,20 +13,50 @@ jobs:
     timeout-minutes: 200
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get install -y ffmpeg jq -qq
-      - name: encode
+      - name: install
         run: |
-          ID="${{ inputs.id }}"; RAW="recordings/raw/${ID}_best.ts"; QUEUE="queue/${ID}.json"
-          START=$(jq -r .start $QUEUE); DUR=$(jq -r .duration $QUEUE)
-          FIRST_PTS=$(ffprobe -v error -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 "$RAW" | head -n1); [ -z "$FIRST_PTS" ] && FIRST_PTS=0
-          MTIME=$(stat -c %Y "$RAW"); OFFSET=$(( MTIME - START )); [ $OFFSET -lt 0 ] && OFFSET=0
+          sudo apt-get install -y ffmpeg jq -qq
+          pip install awscli -q
+
+      - name: download + encode + upload
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
+          R2_BUCKET: recorder  # ← 同じバケット名に変えて
+        run: |
+          set -e
+          ID="${{ inputs.id }}"
+          ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          QUEUE="queue/${ID}.json"
+          START=$(jq -r .start $QUEUE)
+          DUR=$(jq -r .duration $QUEUE)
+
+          【entity-aws¦canonical_name=AWS】 s3 cp s3://${R2_BUCKET}/raw/${ID}_best.ts ./${ID}_best.ts --endpoint-url $ENDPOINT
+
+          FIRST_PTS=$(ffprobe -v error -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 ./${ID}_best.ts | head -n1)
+          [ -z "$FIRST_PTS" ] && FIRST_PTS=0
+          MTIME=$(stat -c %Y ./${ID}_best.ts)
+          OFFSET=$(( MTIME - START )); [ $OFFSET -lt 0 ] && OFFSET=0
           CUT=$(awk "BEGIN{print $OFFSET + $FIRST_PTS}")
-          mkdir -p recordings
-          ffmpeg -y -ss $CUT -i "$RAW" -t "$DUR" -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k recordings/${ID}.mp4
-          ffmpeg -y -ss $CUT -i "$RAW" -t "$DUR" -c copy recordings/${ID}.ts
-      - name: cleanup
+
+          ffmpeg -y -ss $CUT -i ./${ID}_best.ts -t "$DUR" -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k ${ID}.mp4
+          ffmpeg -y -ss $CUT -i ./${ID}_best.ts -t "$DUR" -c copy ${ID}.ts
+
+          aws s3 cp ./${ID}.mp4 s3://${R2_BUCKET}/recordings/${ID}.mp4 --endpoint-url $ENDPOINT
+          aws s3 cp ./${ID}.ts s3://${R2_BUCKET}/recordings/${ID}.ts --endpoint-url $ENDPOINT
+          aws s3 rm s3://${R2_BUCKET}/raw/${ID}_best.ts --endpoint-url $ENDPOINT
+
+          echo "公開URL: ${R2_PUBLIC_URL}/recordings/${ID}.mp4"
+
+      - name: cleanup queue
         run: |
-          ID="${{ inputs.id }}"; rm -rf recordings/raw/${ID}_best.ts; rm -f queue/${ID}.json
-          git config user.name "uefn1"; git config user.email "uefn1@users.noreply.github.com"
-          git add -A; git commit -m "encode $ID [skip ci]" || true
-          git pull --rebase origin main; git push origin main || true
+          ID="${{ inputs.id }}"
+          rm -f queue/${ID}.json
+          git config user.name "uefn1"
+          git config user.email "uefn1@users.noreply.github.com"
+          git add queue/
+          git commit -m "encode $ID r2 done [skip ci]" || true
+          git pull --rebase origin main
+          git push origin main || true
