@@ -11,31 +11,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: install
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg jq -qq
-      - name: parallel recording
         run: |
-          set +e; shopt -s nullglob; mkdir -p recordings/raw; > /tmp/done.txt
+          sudo apt-get update && sudo apt-get install -y ffmpeg jq -qq
+          pip install awscli -q
+
+      - name: recording + upload to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: recorder  # ← あなたのバケット名に変えて
+        run: |
+          set +e; shopt -s nullglob; mkdir -p /tmp/raw; > /tmp/done.txt
+          ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
           for f in queue/*.json; do
             [ -e "$f" ] || continue
             ID=$(jq -r .id $f); URL=$(jq -r .url $f); DUR=$(jq -r .duration $f)
-            [ -z "$URL" ] || [ "$URL" = "null" ] && continue
-            echo "=== $ID $DUR sec ch=$(jq -r .channel $f) ==="
+            [ -z "$URL" ] && continue
+            echo "=== $ID ==="
             OPTS="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 60 -rw_timeout 15000000 -user_agent Mozilla/5.0"
-            ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy recordings/raw/${ID}_a.ts &
-            ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy recordings/raw/${ID}_b.ts &
-            ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy recordings/raw/${ID}_c.ts &
+            ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy /tmp/raw/${ID}_a.ts &
+            ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy /tmp/raw/${ID}_b.ts &
+            ffmpeg -y $OPTS -i "$URL" -t "$DUR" -c copy /tmp/raw/${ID}_c.ts &
             wait
-            BEST=$(ls -S recordings/raw/${ID}_*.ts 2>/dev/null | head -n1)
-            [ -z "$BEST" ] && echo "fail $ID" && continue
-            cp -f "$BEST" recordings/raw/${ID}_best.ts
-            rm -f recordings/raw/${ID}_a.ts recordings/raw/${ID}_b.ts recordings/raw/${ID}_c.ts
+            BEST=$(ls -S /tmp/raw/${ID}_*.ts 2>/dev/null | head -n1)
+            [ -z "$BEST" ] && continue
+            cp -f "$BEST" /tmp/raw/${ID}_best.ts
+            【entity-aws¦canonical_name=AWS】 s3 cp /tmp/raw/${ID}_best.ts s3://${R2_BUCKET}/raw/${ID}_best.ts --endpoint-url $ENDPOINT
             echo "$ID" >> /tmp/done.txt
+            rm -f /tmp/raw/${ID}_*
           done
-      - name: push and trigger
+
+      - name: trigger encoder
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git config user.name "uefn1"; git config user.email "uefn1@users.noreply.github.com"
-          git add -f recordings/raw/; git commit -m "raw done [skip ci]" || true
-          git pull --rebase origin main; git push origin main || true
           for ID in $(cat /tmp/done.txt 2>/dev/null); do gh workflow run encoder.yml -f id=$ID || true; done
